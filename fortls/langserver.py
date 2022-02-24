@@ -155,6 +155,7 @@ class LangServer:
             "textDocument/signatureHelp": self.serve_signature,
             "textDocument/definition": self.serve_definition,
             "textDocument/references": self.serve_references,
+            "textDocument/documentHighlight": self.serve_highlight,
             "textDocument/hover": self.serve_hover,
             "textDocument/implementation": self.serve_implementation,
             "textDocument/rename": self.serve_rename,
@@ -233,6 +234,7 @@ class LangServer:
             "definitionProvider": True,
             "documentSymbolProvider": True,
             "referencesProvider": True,
+            "documentHighlightProvider": True,
             "hoverProvider": True,
             "implementationProvider": True,
             "renameProvider": True,
@@ -942,6 +944,45 @@ class LangServer:
         return refs, ref_objs
 
     def serve_references(self, request):
+        # Get parameters from request
+        params = request["params"]
+        uri = params["textDocument"]["uri"]
+        def_line = params["position"]["line"]
+        def_char = params["position"]["character"]
+        path = path_from_uri(uri)
+        # Find object
+        file_obj = self.workspace.get(path)
+        if file_obj is None:
+            return None
+        def_obj = self.get_definition(file_obj, def_line, def_char)
+        if def_obj is None:
+            return None
+        # Determine global accessibility and type membership
+        restrict_file = None
+        type_mem = False
+        if def_obj.FQSN.count(":") > 2:
+            if def_obj.parent.get_type() == CLASS_TYPE_ID:
+                type_mem = True
+            else:
+                restrict_file = def_obj.file_ast.file
+                if restrict_file is None:
+                    return None
+        all_refs, _ = self.get_all_references(def_obj, type_mem, file_obj=restrict_file)
+        refs = []
+        for (filename, file_refs) in all_refs.items():
+            for ref in file_refs:
+                refs.append(
+                    {
+                        "uri": path_to_uri(filename),
+                        "range": {
+                            "start": {"line": ref[0], "character": ref[1]},
+                            "end": {"line": ref[0], "character": ref[2]},
+                        },
+                    }
+                )
+        return refs
+
+    def serve_highlight(self, request):
         # Get parameters from request
         params = request["params"]
         uri = params["textDocument"]["uri"]
