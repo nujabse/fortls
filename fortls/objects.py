@@ -1,10 +1,10 @@
-from __future__ import annotations, print_function
+from __future__ import annotations
 
 import copy
 import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Pattern, Set
+from dataclasses import dataclass, replace
+from typing import Pattern
 
 from fortls.constants import (
     ASSOC_TYPE_ID,
@@ -24,64 +24,21 @@ from fortls.constants import (
     SUBROUTINE_TYPE_ID,
     VAR_TYPE_ID,
     WHERE_TYPE_ID,
+    FRegex,
 )
+from fortls.ftypes import IncludeInfo, UseInfo
 from fortls.helper_functions import get_keywords, get_paren_substring, get_var_stack
+from fortls.json_templates import diagnostic_json, location_json, range_json
 from fortls.jsonrpc import path_to_uri
-from fortls.regex_patterns import CLASS_VAR_REGEX, DEF_KIND_REGEX
-
-# Helper types
-VAR_info = NamedTuple(
-    "VAR_info", [("type_word", str), ("keywords", List[str]), ("var_names", List[str])]
-)
-SUB_info = NamedTuple(
-    "SUB_info",
-    [("name", str), ("args", str), ("mod_flag", bool), ("keywords", List[str])],
-)
-FUN_info = NamedTuple(
-    "FUN_info",
-    [
-        ("name", str),
-        ("args", str),
-        ("return_type", None),
-        ("return_var", str),
-        ("mod_flag", bool),
-        ("keywords", List[str]),
-    ],
-)
-SELECT_info = NamedTuple(
-    "SELECT_info", [("type", int), ("binding", str), ("desc", str)]
-)
-CLASS_info = NamedTuple(
-    "CLASS_info", [("name", str), ("parent", str), ("keywords", List[str])]
-)
-USE_info = NamedTuple(
-    "USE_info",
-    [("mod_name", str), ("only_list", Set[str]), ("rename_map", Dict[str, str])],
-)
-GEN_info = NamedTuple(
-    "GEN_info",
-    [("bound_name", str), ("pro_links", List[str]), ("vis_flag", int)],
-)
-SMOD_info = NamedTuple("SMOD_info", [("name", str), ("parent", str)])
-INT_info = NamedTuple("INT_info", [("name", str), ("abstract", bool)])
-VIS_info = NamedTuple("VIS_info", [("type", int), ("obj_names", List[str])])
-
-
-@dataclass
-class INCLUDE_info:
-    line_number: int
-    path: str
-    file: None  # fortran_file
-    scope_objs: list[str]
 
 
 def get_use_tree(
-    scope: fortran_scope,
-    use_dict: dict,
+    scope: Scope,
+    use_dict: dict[str, UseInfo],
     obj_tree: dict,
-    only_list: list = None,
-    rename_map: dict = None,
-    curr_path: list = None,
+    only_list: list[str] = None,
+    rename_map: dict[str, str] = None,
+    curr_path: list[str] = None,
 ):
     def intersect_only(use_stmnt):
         tmp_list = []
@@ -135,16 +92,16 @@ def get_use_tree(
                         only_len = len(use_dict_mod.only_list)
                         new_rename = merged_rename.get(only_name, None)
                         if new_rename is not None:
-                            use_dict[use_stmnt.mod_name] = use_dict_mod._replace(
-                                rename_map=merged_rename
+                            use_dict[use_stmnt.mod_name] = replace(
+                                use_dict_mod, rename_map=merged_rename
                             )
             else:
-                use_dict[use_stmnt.mod_name] = USE_info(use_stmnt.mod_name, set(), {})
+                use_dict[use_stmnt.mod_name] = UseInfo(use_stmnt.mod_name, set(), {})
             # Skip if we have already visited module with the same only list
             if old_len == len(use_dict_mod.only_list):
                 continue
         else:
-            use_dict[use_stmnt.mod_name] = USE_info(
+            use_dict[use_stmnt.mod_name] = UseInfo(
                 use_stmnt.mod_name, set(merged_use_list), merged_rename
             )
         # Descend USE tree
@@ -160,7 +117,7 @@ def get_use_tree(
 
 
 def find_in_scope(
-    scope: fortran_scope,
+    scope: Scope,
     var_name: str,
     obj_tree: dict,
     interface: bool = False,
@@ -168,7 +125,7 @@ def find_in_scope(
     var_line_number: int = None,
 ):
     def check_scope(
-        local_scope: fortran_scope,
+        local_scope: Scope,
         var_name_lower: str,
         filter_public: bool = False,
         var_line_number: int = None,
@@ -189,7 +146,7 @@ def find_in_scope(
                 # and start of scope i.e. function definition is equal to the request ln
                 # then we are need to skip this child
                 if (
-                    isinstance(local_scope, fortran_function)
+                    isinstance(local_scope, Function)
                     and local_scope.name.lower() == child.name.lower()
                     and var_line_number in (local_scope.sline, local_scope.eline)
                 ):
@@ -214,7 +171,7 @@ def find_in_scope(
             if strip_str == inc.path:
                 if inc.file is None:
                     return None
-                return fortran_include(inc.file.ast, inc.line_number, inc.path)
+                return Include(inc.file.ast, inc.line_number, inc.path)
 
     # Setup USE search
     use_dict = get_use_tree(scope, {}, obj_tree)
@@ -285,7 +242,7 @@ def find_in_workspace(
     return matching_symbols
 
 
-def climb_type_tree(var_stack, curr_scope: fortran_scope, obj_tree: dict):
+def climb_type_tree(var_stack, curr_scope: Scope, obj_tree: dict):
     """Walk up user-defined type sequence to determine final field type"""
     # Find base variable in current scope
     iVar = 0
@@ -334,7 +291,14 @@ class USE_line:
             }
 
 
-class fortran_diagnostic:
+@dataclass
+class AssociateMap:
+    var: Variable
+    bind_name: str
+    link_name: str
+
+
+class Diagnostic:
     def __init__(
         self, sline: int, message: str, severity: int = 1, find_word: str = None
     ):
@@ -356,30 +320,21 @@ class fortran_diagnostic:
     def build(self, file_obj):
         schar = echar = 0
         if self.find_word is not None:
-            self.sline, found_schar, found_echar = file_obj.find_word_in_code_line(
+            self.sline, obj_range = file_obj.find_word_in_code_line(
                 self.sline, self.find_word
             )
-            if found_schar >= 0:
-                schar = found_schar
-                echar = found_echar
-        diag = {
-            "range": {
-                "start": {"line": self.sline, "character": schar},
-                "end": {"line": self.sline, "character": echar},
-            },
-            "message": self.message,
-            "severity": self.severity,
-        }
+            if obj_range.start >= 0:
+                schar = obj_range.start
+                echar = obj_range.end
+        diag = diagnostic_json(
+            self.sline, schar, self.sline, echar, self.message, self.severity
+        )
         if self.has_related:
             diag["relatedInformation"] = [
                 {
-                    "location": {
-                        "uri": path_to_uri(self.related_path),
-                        "range": {
-                            "start": {"line": self.related_line, "character": 0},
-                            "end": {"line": self.related_line, "character": 0},
-                        },
-                    },
+                    **location_json(
+                        path_to_uri(self.related_path), self.related_line, 0
+                    ),
                     "message": self.related_message,
                 }
             ]
@@ -387,7 +342,7 @@ class fortran_diagnostic:
 
 
 # Fortran object classes
-class fortran_obj:
+class FortranObj:
     def __init__(self):
         self.vis: int = 0
         self.def_vis: int = 0
@@ -511,12 +466,12 @@ class fortran_obj:
         return None, known_types
 
 
-class fortran_scope(fortran_obj):
+class Scope(FortranObj):
     def __init__(self, file_ast, line_number: int, name: str, keywords: list = None):
         super().__init__()
         if keywords is None:
             keywords = []
-        self.file_ast: fortran_ast = file_ast
+        self.file_ast: FortranAST = file_ast
         self.sline: int = line_number
         self.eline: int = line_number
         self.name: str = name
@@ -532,7 +487,7 @@ class fortran_scope(fortran_obj):
         if file_ast.enc_scope_name is not None:
             self.FQSN = file_ast.enc_scope_name.lower() + "::" + self.name.lower()
 
-    def copy_from(self, copy_source: fortran_scope):
+    def copy_from(self, copy_source: Scope):
         # Pass the reference, we don't want shallow copy since that would still
         # result into 2 versions of attributes between copy_source and self
         for k, v in copy_source.__dict__.items():
@@ -641,7 +596,7 @@ class fortran_scope(fortran_obj):
             if (contains_line >= child.sline) and (
                 child.get_type(no_link=True) in after_contains_list
             ):
-                new_diag = fortran_diagnostic(
+                new_diag = Diagnostic(
                     line_number,
                     message="Subroutine/Function definition before CONTAINS statement",
                     severity=1,
@@ -655,7 +610,7 @@ class fortran_scope(fortran_obj):
             # Check other variables in current scope
             if child.FQSN in FQSN_dict:
                 if line_number > FQSN_dict[child.FQSN]:
-                    new_diag = fortran_diagnostic(
+                    new_diag = Diagnostic(
                         line_number,
                         message=f'Variable "{child.name}" declared twice in scope',
                         severity=1,
@@ -679,7 +634,7 @@ class fortran_scope(fortran_obj):
                         parent_var.FQSN == self.FQSN
                     ):
                         continue
-                    new_diag = fortran_diagnostic(
+                    new_diag = Diagnostic(
                         line_number,
                         message=(
                             f'Variable "{child.name}" masks variable in parent scope'
@@ -704,7 +659,7 @@ class fortran_scope(fortran_obj):
                 if (self.parent is None) or (
                     self.parent.get_type() != INTERFACE_TYPE_ID
                 ):
-                    new_diag = fortran_diagnostic(
+                    new_diag = Diagnostic(
                         use_stmnt.line_number - 1,
                         message="IMPORT statement outside of interface",
                         severity=1,
@@ -712,7 +667,7 @@ class fortran_scope(fortran_obj):
                     errors.append(new_diag)
                 continue
             if use_stmnt.mod_name not in obj_tree:
-                new_diag = fortran_diagnostic(
+                new_diag = Diagnostic(
                     use_stmnt.line_number - 1,
                     message=f'Module "{use_stmnt.mod_name}" not found in project',
                     severity=3,
@@ -720,7 +675,7 @@ class fortran_scope(fortran_obj):
                 )
                 errors.append(new_diag)
         if (self.implicit_line is not None) and (last_use_line >= self.implicit_line):
-            new_diag = fortran_diagnostic(
+            new_diag = Diagnostic(
                 self.implicit_line - 1,
                 message="USE statements after IMPLICIT statement",
                 severity=1,
@@ -739,26 +694,20 @@ class fortran_scope(fortran_obj):
                     first_sub_line = min(first_sub_line, child.sline - 1)
             edits.append(
                 {
-                    "range": {
-                        "start": {"line": first_sub_line, "character": 0},
-                        "end": {"line": first_sub_line, "character": 0},
-                    },
+                    **range_json(first_sub_line, 0, first_sub_line, 0),
                     "newText": "CONTAINS\n",
                 }
             )
         edits.append(
             {
-                "range": {
-                    "start": {"line": line_number, "character": 0},
-                    "end": {"line": line_number, "character": 0},
-                },
+                **range_json(line_number, 0, line_number, 0),
                 "newText": interface_string + "\n",
             }
         )
         return self.file_ast.path, edits
 
 
-class fortran_module(fortran_scope):
+class Module(Scope):
     def get_type(self, no_link=False):
         return MODULE_TYPE_ID
 
@@ -771,20 +720,20 @@ class fortran_module(fortran_scope):
         return True
 
 
-class fortran_include(fortran_scope):
+class Include(Scope):
     def get_desc(self):
         return "INCLUDE"
 
 
-class fortran_program(fortran_module):
+class Program(Module):
     def get_desc(self):
         return "PROGRAM"
 
 
-class fortran_submodule(fortran_module):
+class Submodule(Module):
     def __init__(
         self,
-        file_ast: fortran_ast,
+        file_ast: FortranAST,
         line_number: int,
         name: str,
         ancestor_name: str = None,
@@ -839,11 +788,11 @@ class fortran_submodule(fortran_module):
                     if child.get_type() == BASE_TYPE_ID:
                         child_old = child
                         if prototype.get_type() == SUBROUTINE_TYPE_ID:
-                            child = fortran_subroutine(
+                            child = Subroutine(
                                 child_old.file_ast, child_old.sline, child_old.name
                             )
                         elif prototype.get_type() == FUNCTION_TYPE_ID:
-                            child = fortran_function(
+                            child = Function(
                                 child_old.file_ast, child_old.sline, child_old.name
                             )
                         child.copy_from(child_old)
@@ -861,10 +810,10 @@ class fortran_submodule(fortran_module):
         return True
 
 
-class fortran_subroutine(fortran_scope):
+class Subroutine(Scope):
     def __init__(
         self,
-        file_ast: fortran_ast,
+        file_ast: FortranAST,
         line_number: int,
         name: str,
         args: str = "",
@@ -885,7 +834,7 @@ class fortran_subroutine(fortran_scope):
     def is_callable(self):
         return True
 
-    def copy_interface(self, copy_source: fortran_subroutine) -> list[str]:
+    def copy_interface(self, copy_source: Subroutine) -> list[str]:
         # Copy arguments
         self.args = copy_source.args
         self.args_snip = copy_source.args_snip
@@ -1054,7 +1003,7 @@ class fortran_subroutine(fortran_scope):
     def get_diagnostics(self):
         errors = []
         for missing_obj in self.missing_args:
-            new_diag = fortran_diagnostic(
+            new_diag = Diagnostic(
                 missing_obj.sline - 1,
                 f'Variable "{missing_obj.name}" with INTENT keyword not found in'
                 " argument list",
@@ -1069,7 +1018,7 @@ class fortran_subroutine(fortran_scope):
         for (i, arg_obj) in enumerate(self.arg_objs):
             if arg_obj is None:
                 arg_name = arg_list[i].strip()
-                new_diag = fortran_diagnostic(
+                new_diag = Diagnostic(
                     self.sline - 1,
                     f'No matching declaration found for argument "{arg_name}"',
                     severity=1,
@@ -1079,10 +1028,10 @@ class fortran_subroutine(fortran_scope):
         return errors
 
 
-class fortran_function(fortran_subroutine):
+class Function(Subroutine):
     def __init__(
         self,
-        file_ast: fortran_ast,
+        file_ast: FortranAST,
         line_number: int,
         name: str,
         args: str = "",
@@ -1100,12 +1049,12 @@ class fortran_function(fortran_subroutine):
         self.mod_scope: bool = mod_flag
         self.result_name: str = result_name
         self.result_type: str = result_type
-        self.result_obj: fortran_var = None
+        self.result_obj: Variable = None
         # Set the implicit result() name to be the function name
         if self.result_name is None:
             self.result_name = self.name
 
-    def copy_interface(self, copy_source: fortran_function):
+    def copy_interface(self, copy_source: Function):
         # Call the parent class method
         child_names = super().copy_interface(copy_source)
         # Return specific options
@@ -1143,20 +1092,16 @@ class fortran_function(fortran_subroutine):
         """Construct the hover message for a FUNCTION.
         Two forms are produced here the `long` i.e. the normal for hover requests
 
-        ```
         [MODIFIERS] FUNCTION NAME([ARGS]) RESULT(RESULT_VAR)
           TYPE, [ARG_MODIFIERS] :: [ARGS]
           TYPE, [RESULT_MODIFIERS] :: RESULT_VAR
-        ```
 
         note: intrinsic functions will display slightly different,
         `RESULT_VAR` and its `TYPE` might not always be present
 
         short form, used when functions are arguments in functions and subroutines:
 
-        ```
         FUNCTION NAME([ARGS]) :: ARG_LIST_NAME
-        ```
 
         Parameters
         ----------
@@ -1213,9 +1158,9 @@ class fortran_function(fortran_subroutine):
         return "\n".join(interface_array)
 
 
-class fortran_type(fortran_scope):
+class Type(Scope):
     def __init__(
-        self, file_ast: fortran_ast, line_number: int, name: str, keywords: list
+        self, file_ast: FortranAST, line_number: int, name: str, keywords: list
     ):
         super().__init__(file_ast, line_number, name, keywords)
         #
@@ -1295,7 +1240,7 @@ class fortran_type(fortran_scope):
             if (not self.abstract) and (
                 in_child.keywords.count(KEYWORD_ID_DICT["deferred"]) > 0
             ):
-                new_diag = fortran_diagnostic(
+                new_diag = Diagnostic(
                     self.eline - 1,
                     f'Deferred procedure "{in_child.name}" not implemented',
                     severity=1,
@@ -1317,10 +1262,7 @@ class fortran_type(fortran_scope):
         if self.contains_start is None:
             edits.append(
                 {
-                    "range": {
-                        "start": {"line": line_number, "character": 0},
-                        "end": {"line": line_number, "character": 0},
-                    },
+                    **range_json(line_number, 0, line_number, 0),
                     "newText": "CONTAINS\n",
                 }
             )
@@ -1347,15 +1289,12 @@ class fortran_type(fortran_scope):
                     continue
                 edits.append(
                     {
-                        "range": {
-                            "start": {"line": line_number, "character": 0},
-                            "end": {"line": line_number, "character": 0},
-                        },
+                        **range_json(line_number, 0, line_number, 0),
                         "newText": "  PROCEDURE :: {0} => {0}\n".format(in_child.name),
                     }
                 )
                 edits += interface_edits
-                new_diag = fortran_diagnostic(
+                new_diag = Diagnostic(
                     line_number,
                     f'Deferred procedure "{in_child.name}" not implemented',
                     severity=1,
@@ -1380,8 +1319,8 @@ class fortran_type(fortran_scope):
         return actions
 
 
-class fortran_block(fortran_scope):
-    def __init__(self, file_ast: fortran_ast, line_number: int, name: str):
+class Block(Scope):
+    def __init__(self, file_ast: FortranAST, line_number: int, name: str):
         super().__init__(file_ast, line_number, name)
 
     def get_type(self, no_link=False):
@@ -1397,8 +1336,8 @@ class fortran_block(fortran_scope):
         return True
 
 
-class fortran_do(fortran_block):
-    def __init__(self, file_ast: fortran_ast, line_number: int, name: str):
+class Do(Block):
+    def __init__(self, file_ast: FortranAST, line_number: int, name: str):
         super().__init__(file_ast, line_number, name)
 
     def get_type(self, no_link=False):
@@ -1408,8 +1347,8 @@ class fortran_do(fortran_block):
         return "DO"
 
 
-class fortran_where(fortran_block):
-    def __init__(self, file_ast: fortran_ast, line_number: int, name: str):
+class Where(Block):
+    def __init__(self, file_ast: FortranAST, line_number: int, name: str):
         super().__init__(file_ast, line_number, name)
 
     def get_type(self, no_link=False):
@@ -1419,8 +1358,8 @@ class fortran_where(fortran_block):
         return "WHERE"
 
 
-class fortran_if(fortran_block):
-    def __init__(self, file_ast: fortran_ast, line_number: int, name: str):
+class If(Block):
+    def __init__(self, file_ast: FortranAST, line_number: int, name: str):
         super().__init__(file_ast, line_number, name)
 
     def get_type(self, no_link=False):
@@ -1430,10 +1369,10 @@ class fortran_if(fortran_block):
         return "IF"
 
 
-class fortran_associate(fortran_block):
-    def __init__(self, file_ast: fortran_ast, line_number: int, name: str):
+class Associate(Block):
+    def __init__(self, file_ast: FortranAST, line_number: int, name: str):
         super().__init__(file_ast, line_number, name)
-        self.assoc_links = []
+        self.links: list[AssociateMap] = []  # holds the info to associate variables
 
     def get_type(self, no_link=False):
         return ASSOC_TYPE_ID
@@ -1441,32 +1380,64 @@ class fortran_associate(fortran_block):
     def get_desc(self):
         return "ASSOCIATE"
 
-    def create_binding_variable(self, file_ast, line_number, bound_name, link_var):
-        new_var = fortran_var(file_ast, line_number, bound_name, "UNKNOWN", [])
-        self.assoc_links.append([new_var, bound_name, link_var])
+    def create_binding_variable(
+        self, file_ast: FortranAST, line_number: int, bind_name: str, link_name: str
+    ) -> Variable:
+        """Create a new variable to be linked upon resolution to the real variable
+        that contains the information of the mapping from the parent scope to the
+        ASSOCIATE block scope.
+
+        Parameters
+        ----------
+        file_ast : fortran_ast
+            AST file
+        line_number : int
+            Line number
+        bind_name : str
+            Name of the ASSOCIATE block variable
+        link_name : str
+            Name of the parent scope variable
+
+        Returns
+        -------
+        fortran_var
+            Variable object holding the ASSOCIATE block variable, pending resolution
+        """
+        new_var = Variable(file_ast, line_number, bind_name, "UNKNOWN", [])
+        self.links.append(AssociateMap(new_var, bind_name, link_name))
         return new_var
 
     def resolve_link(self, obj_tree):
-        for assoc_link in self.assoc_links:
-            var_stack = get_var_stack(assoc_link[2])
-            if len(var_stack) > 1:
+        # Loop through the list of the associated variables map and resolve the links
+        # find the AST node that that corresponds to the variable with link_name
+        for assoc in self.links:
+            # TODO: extract the dimensions component from the link_name
+            # re.sub(r'\(.*\)', '', link_name) removes the dimensions component
+            # keywords = re.match(r'(.*)\((.*)\)', link_name).groups()
+            # now pass the keywords through the dimension_parser and set the keywords
+            # in the associate object. Hover should now pick the local keywords
+            # over the linked_object keywords
+            assoc.link_name = re.sub(r"\(.*\)", "", assoc.link_name)
+            var_stack = get_var_stack(assoc.link_name)
+            is_member = len(var_stack) > 1
+            if is_member:
                 type_scope = climb_type_tree(var_stack, self, obj_tree)
                 if type_scope is None:
                     continue
                 var_obj = find_in_scope(type_scope, var_stack[-1], obj_tree)
                 if var_obj is not None:
-                    assoc_link[0].link_obj = var_obj
+                    assoc.var.link_obj = var_obj
             else:
-                var_obj = find_in_scope(self, assoc_link[2], obj_tree)
+                var_obj = find_in_scope(self, assoc.link_name, obj_tree)
                 if var_obj is not None:
-                    assoc_link[0].link_obj = var_obj
+                    assoc.var.link_obj = var_obj
 
     def require_link(self):
         return True
 
 
-class fortran_enum(fortran_block):
-    def __init__(self, file_ast: fortran_ast, line_number: int, name: str):
+class Enum(Block):
+    def __init__(self, file_ast: FortranAST, line_number: int, name: str):
         super().__init__(file_ast, line_number, name)
 
     def get_type(self, no_link=False):
@@ -1476,8 +1447,8 @@ class fortran_enum(fortran_block):
         return "ENUM"
 
 
-class fortran_select(fortran_block):
-    def __init__(self, file_ast: fortran_ast, line_number: int, name: str, select_info):
+class Select(Block):
+    def __init__(self, file_ast: FortranAST, line_number: int, name: str, select_info):
         super().__init__(file_ast, line_number, name)
         self.select_type = select_info.type
         self.binding_name = None
@@ -1525,18 +1496,18 @@ class fortran_select(fortran_block):
             bound_var = None
         # Create variable
         if binding_name is not None:
-            return fortran_var(
+            return Variable(
                 file_ast, line_number, binding_name, var_desc, [], link_obj=bound_var
             )
         elif (binding_name is None) and (bound_var is not None):
-            return fortran_var(file_ast, line_number, bound_var, var_desc, [])
+            return Variable(file_ast, line_number, bound_var, var_desc, [])
         return None
 
 
-class fortran_int(fortran_scope):
+class Interface(Scope):
     def __init__(
         self,
-        file_ast: fortran_ast,
+        file_ast: FortranAST,
         line_number: int,
         name: str,
         abstract: bool = False,
@@ -1574,10 +1545,10 @@ class fortran_int(fortran_scope):
         return True
 
 
-class fortran_var(fortran_obj):
+class Variable(FortranObj):
     def __init__(
         self,
-        file_ast: fortran_ast,
+        file_ast: FortranAST,
         line_number: int,
         name: str,
         var_desc: str,
@@ -1588,14 +1559,14 @@ class fortran_var(fortran_obj):
         super().__init__()
         if keyword_info is None:
             keyword_info = {}
-        self.file_ast: fortran_ast = file_ast
+        self.file_ast: FortranAST = file_ast
         self.sline: int = line_number
         self.eline: int = line_number
         self.name: str = name
         self.desc: str = var_desc
         self.keywords: list = keywords
         self.keyword_info: dict = keyword_info
-        self.callable: bool = CLASS_VAR_REGEX.match(var_desc) is not None
+        self.callable: bool = FRegex.CLASS_VAR.match(var_desc) is not None
         self.children: list = []
         self.use: list[USE_line] = []
         self.link_obj = None
@@ -1669,6 +1640,7 @@ class fortran_var(fortran_obj):
                         self.type_obj = type_obj
         return self.type_obj
 
+    # XXX: unused delete or use for associate blocks
     def set_dim(self, dim_str):
         if KEYWORD_ID_DICT["dimension"] not in self.keywords:
             self.keywords.append(KEYWORD_ID_DICT["dimension"])
@@ -1686,16 +1658,24 @@ class fortran_var(fortran_obj):
 
     def get_hover(self, long=False, include_doc=True, drop_arg=-1):
         doc_str = self.get_documentation()
-        hover_str = ", ".join(
-            [self.desc] + get_keywords(self.keywords, self.keyword_info)
-        )
+        # In associated blocks we need to fetch the desc and keywords of the
+        # linked object
+        hover_str = ", ".join([self.get_desc()] + self.get_keywords())
         # TODO: at this stage we can mae this lowercase
         # Add parameter value in the output
         if self.is_parameter() and self.param_val:
             hover_str += f" :: {self.name} = {self.param_val}"
         if include_doc and (doc_str is not None):
-            hover_str += "\n {0}".format("\n ".join(doc_str.splitlines()))
+            hover_str += "\n {}".format("\n ".join(doc_str.splitlines()))
         return hover_str, True
+
+    def get_keywords(self):
+        # TODO: if local keywords are set they should take precedence over link_obj
+        # Alternatively, I could do a dictionary merge with local variables
+        # having precedence by default and use a flag to override?
+        if self.link_obj is not None:
+            return get_keywords(self.link_obj.keywords, self.link_obj.keyword_info)
+        return get_keywords(self.keywords, self.keyword_info)
 
     def is_optional(self):
         if self.keywords.count(KEYWORD_ID_DICT["optional"]) > 0:
@@ -1718,7 +1698,7 @@ class fortran_var(fortran_obj):
 
     def check_definition(self, obj_tree, known_types={}, interface=False):
         # Check for type definition in scope
-        type_match = DEF_KIND_REGEX.match(self.desc)
+        type_match = FRegex.DEF_KIND.match(self.desc)
         if type_match is not None:
             var_type = type_match.group(1).strip().lower()
             if var_type == "procedure":
@@ -1747,7 +1727,7 @@ class fortran_var(fortran_obj):
             if type_info is not None:
                 if type_info[0] == 1:
                     if interface:
-                        out_diag = fortran_diagnostic(
+                        out_diag = Diagnostic(
                             self.sline - 1,
                             message=(
                                 f'Object "{desc_obj_name}" not imported in interface'
@@ -1756,7 +1736,7 @@ class fortran_var(fortran_obj):
                             find_word=desc_obj_name,
                         )
                     else:
-                        out_diag = fortran_diagnostic(
+                        out_diag = Diagnostic(
                             self.sline - 1,
                             message=f'Object "{desc_obj_name}" not found in scope',
                             severity=1,
@@ -1772,10 +1752,10 @@ class fortran_var(fortran_obj):
         return None, known_types
 
 
-class fortran_meth(fortran_var):
+class Method(Variable):  # i.e. TypeBound procedure
     def __init__(
         self,
-        file_ast: fortran_ast,
+        file_ast: FortranAST,
         line_number: int,
         name: str,
         var_desc: str,
@@ -1901,7 +1881,7 @@ class fortran_meth(fortran_var):
         return None, known_types
 
 
-class fortran_ast:
+class FortranAST:
     def __init__(self, file_obj=None):
         self.file = file_obj
         self.path: str = None
@@ -1927,13 +1907,13 @@ class fortran_ast:
         self.END_SCOPE_REGEX: Pattern = None
         self.enc_scope_name: str = None
         self.last_obj = None
-        self.pending_doc = None
+        self.pending_doc: str = None
 
     def create_none_scope(self):
         """Create empty scope to hold non-module contained items"""
         if self.none_scope is not None:
             raise ValueError
-        self.none_scope = fortran_program(self, 1, "main")
+        self.none_scope = Program(self, 1, "main")
         self.add_scope(
             self.none_scope, re.compile(r"[ ]*END[ ]*PROGRAM", re.I), exportable=False
         )
@@ -1946,7 +1926,7 @@ class fortran_ast:
 
     def add_scope(
         self,
-        new_scope: fortran_scope,
+        new_scope: Scope,
         END_SCOPE_REGEX: Pattern[str],
         exportable: bool = True,
         req_container: bool = False,
@@ -1995,7 +1975,7 @@ class fortran_ast:
             self.END_SCOPE_REGEX = None
         self.enc_scope_name = self.get_enc_scope_name()
 
-    def add_variable(self, new_var: fortran_var):
+    def add_variable(self, new_var: Variable):
         if self.current_scope is None:
             self.create_none_scope()
             new_var.FQSN = self.none_scope.FQSN + "::" + new_var.name.lower()
@@ -2031,7 +2011,7 @@ class fortran_ast:
         self.current_scope.add_use(mod_word, line_number, only_list, rename_map)
 
     def add_include(self, path: str, line_number: int):
-        self.include_statements.append(INCLUDE_info(line_number, path, None, []))
+        self.include_statements.append(IncludeInfo(line_number, path, None, []))
 
     def add_doc(self, doc_string: str, forward: bool = False):
         if doc_string == "":
@@ -2041,6 +2021,26 @@ class fortran_ast:
         else:
             if self.last_obj is not None:
                 self.last_obj.add_doc(doc_string)
+
+    def add_error(self, msg: str, sev: int, ln: int, sch: int, ech: int = None):
+        """Add a Diagnostic error, encountered during parsing, for a range
+        in the document.
+
+        Parameters
+        ----------
+        msg : str
+            Error message
+        sev : int
+            Severity, Error, Warning, Notification
+        ln : int
+            Line number
+        sch : int
+            Start character
+        ech : int
+            End character
+        """
+        # Convert from Editor line numbers 1-base index to LSP index which is 0-based
+        self.parse_errors.append(diagnostic_json(ln - 1, sch, ln - 1, ech, msg, sev))
 
     def start_ppif(self, line_number: int):
         self.pp_if.append([line_number - 1, -1])
@@ -2156,34 +2156,19 @@ class fortran_ast:
 
     def check_file(self, obj_tree):
         errors = []
-        diagnostics = []
-        tmp_list = self.scope_list[:]
+        tmp_list = self.scope_list[:]  # shallow copy
         if self.none_scope is not None:
             tmp_list += [self.none_scope]
-        for error in self.parse_errors:
-            diagnostics.append(
-                {
-                    "range": {
-                        "start": {
-                            "line": error["line"] - 1,
-                            "character": error["schar"],
-                        },
-                        "end": {"line": error["line"] - 1, "character": error["echar"]},
-                    },
-                    "message": error["mess"],
-                    "severity": error["sev"],
-                }
-            )
         for error in self.end_errors:
             if error[0] >= 0:
                 message = f"Unexpected end of scope at line {error[0]}"
             else:
                 message = "Unexpected end statement: No open scopes"
-            errors.append(fortran_diagnostic(error[1] - 1, message=message, severity=1))
+            errors.append(Diagnostic(error[1] - 1, message=message, severity=1))
         for scope in tmp_list:
             if not scope.check_valid_parent():
                 errors.append(
-                    fortran_diagnostic(
+                    Diagnostic(
                         scope.sline - 1,
                         message=f'Invalid parent for "{scope.get_desc()}" declaration',
                         severity=1,
@@ -2192,4 +2177,4 @@ class fortran_ast:
             errors += scope.check_use(obj_tree)
             errors += scope.check_definitions(obj_tree)
             errors += scope.get_diagnostics()
-        return errors, diagnostics
+        return errors, self.parse_errors

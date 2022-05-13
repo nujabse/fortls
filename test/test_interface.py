@@ -12,13 +12,14 @@ parser = commandline_args("fortls")
 def test_command_line_general_options():
     args = parser.parse_args(
         "-c config_file.json -n 2 --notify_init --incremental_sync --sort_keywords"
-        " --debug_log".split()
+        " --disable_autoupdate --debug_log".split()
     )
     assert args.config == "config_file.json"
     assert args.nthreads == 2
     assert args.notify_init
     assert args.incremental_sync
     assert args.sort_keywords
+    assert args.disable_autoupdate
     assert args.debug_log
 
 
@@ -27,10 +28,10 @@ def test_command_line_file_parsing_options():
         "--source_dirs tmp ./local /usr/include/** --incl_suffixes .FF .fpc .h f20"
         " --excl_suffixes _tmp.f90 _h5hut_tests.F90 --excl_paths exclude tests".split()
     )
-    assert args.source_dirs == set(["tmp", "./local", "/usr/include/**"])
+    assert args.source_dirs == {"tmp", "./local", "/usr/include/**"}
     assert args.incl_suffixes == [".FF", ".fpc", ".h", "f20"]
-    assert args.excl_suffixes == set(["_tmp.f90", "_h5hut_tests.F90"])
-    assert args.excl_paths == set(["exclude", "tests"])
+    assert args.excl_suffixes == {"_tmp.f90", "_h5hut_tests.F90"}
+    assert args.excl_paths == {"exclude", "tests"}
 
 
 def test_command_line_autocomplete_options():
@@ -47,9 +48,8 @@ def test_command_line_autocomplete_options():
 
 def test_command_line_hover_options():
     args = parser.parse_args(
-        "--variable_hover --hover_signature --hover_language FortranFreeForm".split()
+        "--hover_signature --hover_language FortranFreeForm".split()
     )
-    assert args.variable_hover
     assert args.hover_signature
     assert args.hover_language == "FortranFreeForm"
 
@@ -69,7 +69,7 @@ def test_command_line_preprocessor_options():
         ' {"HAVE_PETSC":"","HAVE_ZOLTAN":"","Mat":"type(tMat)"}'.split()
     )
     assert args.pp_suffixes == [".h", ".fh"]
-    assert args.include_dirs == set(["/usr/include/**", "./local/incl"])
+    assert args.include_dirs == {"/usr/include/**", "./local/incl"}
     assert args.pp_defs == {"HAVE_PETSC": "", "HAVE_ZOLTAN": "", "Mat": "type(tMat)"}
 
 
@@ -103,17 +103,16 @@ def test_config_file_general_options():
     assert server.notify_init
     assert server.incremental_sync
     assert server.sort_keywords
+    assert server.disable_autoupdate
 
 
 def test_config_file_dir_parsing_options():
     server, r = unittest_server_init()
     # File parsing
-    assert server.source_dirs == set(
-        [f'{r/"subdir"}', f'{r/"pp"}', f'{r/"pp"/"include"}']
-    )
+    assert server.source_dirs == {f'{r/"subdir"}', f'{r/"pp"}', f'{r/"pp"/"include"}'}
     assert server.incl_suffixes == [".FF", ".fpc", ".h", "f20"]
-    assert server.excl_suffixes == set(["_tmp.f90", "_h5hut_tests.F90"])
-    assert server.excl_paths == set([f'{r/"excldir"}', f'{r/"hover"}'])
+    assert server.excl_suffixes == {"_tmp.f90", "_h5hut_tests.F90"}
+    assert server.excl_paths == {f'{r/"excldir"}', f'{r/"hover"}'}
 
 
 def test_config_file_autocomplete_options():
@@ -129,7 +128,6 @@ def test_config_file_autocomplete_options():
 def test_config_file_hover_options():
     server, root = unittest_server_init()
     # Hover options
-    assert server.variable_hover
     assert server.hover_signature
     assert server.hover_language == "FortranFreeForm"
 
@@ -146,7 +144,7 @@ def test_config_file_preprocessor_options():
     server, root = unittest_server_init()
     # Preprocessor options
     assert server.pp_suffixes == [".h", ".fh"]
-    assert server.include_dirs == set([f'{root/"include"}'])
+    assert server.include_dirs == {f'{root/"include"}'}
     assert server.pp_defs == {
         "HAVE_PETSC": "",
         "HAVE_ZOLTAN": "",
@@ -164,3 +162,30 @@ def test_config_file_codeactions_options():
     server, root = unittest_server_init()
     # Code Actions options
     assert server.enable_code_actions
+
+
+def test_version_update_pypi():
+    from packaging import version
+
+    from fortls.jsonrpc import JSONRPC2Connection, ReadWriter
+    from fortls.langserver import LangServer
+
+    parser = commandline_args("fortls")
+    args = parser.parse_args("-c f90_config.json".split())
+    args = vars(args)
+    args["disable_autoupdate"] = False
+
+    stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+    s = LangServer(conn=JSONRPC2Connection(ReadWriter(stdin, stdout)), settings=args)
+    s.root_path = (Path(__file__).parent / "test_source").resolve()
+    did_update = s._update_version_pypi(test=True)
+    assert did_update
+
+    s.disable_autoupdate = True
+    did_update = s._update_version_pypi()
+    assert not did_update
+
+    s.disable_autoupdate = False
+    s._version = version.parse("999.0.0")
+    did_update = s._update_version_pypi()
+    assert not did_update
